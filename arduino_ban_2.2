@@ -1,0 +1,877 @@
+#include <Arduino.h>
+
+#define IN1 4
+#define IN2 5
+#define ENA 11
+
+#define IN3 6
+#define IN4 7
+#define ENB 10
+
+#define ENC_L_A 9
+#define ENC_L_B 3
+
+#define ENC_R_A 8
+#define ENC_R_B 2
+
+const float L = 0.22;                  // wheelbase (m)
+const float r = 0.0335;                // wheel radius (m), D = 67 mm
+const int PPR = 1133;                  // encoder pulses per wheel revolution (calibrated)
+const unsigned long sampleTime = 50;   // sampling period for speed report
+const unsigned long cmdTimeout = 200;  // (A1) safety: auto-stop if no command for >200 ms
+float pwmGain = 750.0;                 // PWM mapping scale (runtime tunable, nominal 750)
+const int PWM_MIN_STRAIGHT = 80;       // overcome static friction while moving straight
+const int PWM_MIN_TURN = 110;          // stronger kick for in-place turning under floor friction
+float leftPwmScale = 1.00;             // per-wheel trim (runtime tunable)
+float rightPwmScale = 1.12;            // right side is slightly boosted to reduce left drift
+const float SPEED_SHAPE_EXP = 3.0;     // base non-linear map exponent
+const float LOW_RANGE_DAMP = 0.35;     // reduce aggressiveness for low speed commands (0..0.8)
+const float LOW_SPEED_FIX_THRESHOLD = 0.05; // m/s, apply extra correction only in very low-speed range
+const float LOW_SPEED_FIX_SCALE = 0.90;     // 0.90 -> reduce low-speed PWM about 10%
+const float TURN_GAIN_BOOST = 2.10;    // boost turn command to better match w_ref in open-loop mode
+const float STOP_EPS = 0.0001;
+const float MAX_V_CMD = 0.084;         // practical max speed measured on current setup
+const float MAX_W_CMD = 0.76;          // 2*MAX_V_CMD/L with L=0.22
+const float PD_DERIV_ALPHA = 0.35;     // derivative low-pass filter weight (0..1)
+const int PD_CORR_LIMIT = 90;          // max absolute PWM correction from PD
+const int PD_OVERSPEED_EXTRA = 35;     // allow stronger negative correction when measured speed is above ref
+const float PD_ERR_EPS = 0.0005;       // m/s, keep very small dead-zone around encoder quantization
+const int SPEED_AVG_SAMPLES = 2;       // 100 ms effective speed window: enough smoothing, much less lag than 4 samples
+const float PD_KP_DEFAULT = 1400.0;
+const float PD_KD_DEFAULT = 1.5;
+const float PD_FF_SCALE_DEFAULT = 1.00;
+const float PD_BRAKE_BOOST_DEFAULT = 1.50;
+const bool DEBUG_VERBOSE = false;      // true: keep detailed debug blocks
+const bool STREAM_WHEN_IDLE = false;   // false: no telemetry spam when robot is idle
+const float CMD_V_DEADBAND = 0.005;    // m/s, keep low-speed control but reject tiny drift
+const float CMD_W_DEADBAND = 0.02;     // rad/s, keep low-speed control but reject tiny drift
+const int DIR_LEFT_SIGN = 1;           // set -1 if measured sign is inverted
+const int DIR_RIGHT_SIGN = -1;         // set -1 if measured sign is inverted
+
+volatile long countLeft = 0;
+volatile long countRight = 0;
+
+float target_v = 0.0;
+float target_w = 0.0;
+unsigned long lastCmdTime = 0;
+unsigned long lastSample = 0;
+bool rawMode = false;
+int rawPwmL = 0;
+int rawPwmR = 0;
+bool vmaxMode = false;
+bool holdMode = false;            // HOLD,1: bench-test, ignore cmdTimeout. HOLD,0: re-enable safety.
+unsigned long vmaxStartMs = 0;
+unsigned long vmaxDurationMs = 8000;
+long vmaxSampleCount = 0;
+long vmaxWarmupSamples = 20; // skip first 1s at 50ms/sample
+float vmaxSum = 0.0;
+float vmaxPeak = 0.0;
+
+bool pdEnabled = true;
+float pdKp = PD_KP_DEFAULT;    // PWM per (m/s)
+float pdKd = PD_KD_DEFAULT;    // PWM per (m/s^2)
+float pdFfScale = PD_FF_SCALE_DEFAULT;      // PD feedforward scale
+float pdBrakeBoost = PD_BRAKE_BOOST_DEFAULT; // overspeed braking boost
+float prevErrL = 0.0;
+float prevErrR = 0.0;
+float filtDErrL = 0.0;
+float filtDErrR = 0.0;
+int pdCorrL = 0;
+int pdCorrR = 0;
+float vLMeasFilt = 0.0;
+float vRMeasFilt = 0.0;
+long avgHistLeft[SPEED_AVG_SAMPLES] = {0};
+long avgHistRight[SPEED_AVG_SAMPLES] = {0};
+long avgSumLeft = 0;
+long avgSumRight = 0;
+int avgIdx = 0;
+int avgCount = 0;
+
+long prevLeft = 0;
+long prevRight = 0;
+
+String rxLine = "";
+
+// Fast direct PORT reads (UNO/ATmega328P) to keep ISR ~1 us instead of ~10 us.
+// Pin map: ENC_L_A=D9=PORTB.1, ENC_L_B=D3=PORTD.3,
+//          ENC_R_A=D8=PORTB.0, ENC_R_B=D2=PORTD.2.
+void isrLeft() {
+  uint8_t a = (PINB >> 1) & 0x01;
+  uint8_t b = (PIND >> 3) & 0x01;
+  if (a == b) {
+    countLeft += DIR_LEFT_SIGN;
+  } else {
+    countLeft -= DIR_LEFT_SIGN;
+  }
+}
+
+void isrRight() {
+  uint8_t a = (PINB >> 0) & 0x01;
+  uint8_t b = (PIND >> 2) & 0x01;
+  if (a == b) {
+    countRight += DIR_RIGHT_SIGN;
+  } else {
+    countRight -= DIR_RIGHT_SIGN;
+  }
+}
+
+void resetPdState() {
+  prevErrL = 0.0;
+  prevErrR = 0.0;
+  filtDErrL = 0.0;
+  filtDErrR = 0.0;
+  pdCorrL = 0;
+  pdCorrR = 0;
+}
+
+void resetPdProfile() {
+  pdKp = PD_KP_DEFAULT;
+  pdKd = PD_KD_DEFAULT;
+  pdFfScale = PD_FF_SCALE_DEFAULT;
+  pdBrakeBoost = PD_BRAKE_BOOST_DEFAULT;
+}
+
+void resetSpeedAverager() {
+  for (int i = 0; i < SPEED_AVG_SAMPLES; i++) {
+    avgHistLeft[i] = 0;
+    avgHistRight[i] = 0;
+  }
+  avgSumLeft = 0;
+  avgSumRight = 0;
+  avgIdx = 0;
+  avgCount = 0;
+  vLMeasFilt = 0.0;
+  vRMeasFilt = 0.0;
+
+  // (B3) Re-baseline pulse counters so the next sample starts from zero delta;
+  // otherwise the next tick computes a delta over the whole gap and PD spikes.
+  noInterrupts();
+  prevLeft = countLeft;
+  prevRight = countRight;
+  interrupts();
+}
+
+int velocityToPwm(float wheelVelocity, int pwmMin, float wheelScale) {
+  float vAbs = (wheelVelocity >= 0.0) ? wheelVelocity : -wheelVelocity;
+  if (vAbs < STOP_EPS) return 0;
+
+  // Normalize by commanded practical max speed.
+  float vNorm = vAbs / MAX_V_CMD;
+  if (vNorm > 1.0) vNorm = 1.0;
+
+  // Dampen low range while preserving endpoint: vNorm=1 still maps to full PWM.
+  float vAdj = vNorm * (1.0 - LOW_RANGE_DAMP * (1.0 - vNorm));
+  if (vAdj < 0.0) vAdj = 0.0;
+  if (vAdj > 1.0) vAdj = 1.0;
+
+  // Keep the same low-speed shaping as the validated open-loop baseline.
+  if (vAbs <= LOW_SPEED_FIX_THRESHOLD) {
+    vAdj *= LOW_SPEED_FIX_SCALE;
+  }
+
+  float vShaped = pow(vAdj, SPEED_SHAPE_EXP);
+  int pwmMag = pwmMin + (int)((255 - pwmMin) * vShaped);
+  pwmMag = (int)(pwmMag * (pwmGain / 750.0));
+  if (pwmMag > 255) pwmMag = 255;
+  int pwm = (wheelVelocity >= 0.0) ? pwmMag : -pwmMag;
+  pwm = (int)(pwm * wheelScale);
+  return constrain(pwm, -255, 255);
+}
+
+// Linear feedforward for PD mode: gives PD much more headroom to track.
+int velocityToPwmLinear(float wheelVelocity, int pwmMin, float wheelScale) {
+  float vAbs = (wheelVelocity >= 0.0) ? wheelVelocity : -wheelVelocity;
+  if (vAbs < STOP_EPS) return 0;
+
+  float vNorm = vAbs / MAX_V_CMD;
+  if (vNorm > 1.0) vNorm = 1.0;
+
+  int pwmMag = pwmMin + (int)((255 - pwmMin) * vNorm);
+  pwmMag = (int)(pwmMag * (pwmGain / 750.0));
+  if (pwmMag > 255) pwmMag = 255;
+  int pwm = (wheelVelocity >= 0.0) ? pwmMag : -pwmMag;
+  pwm = (int)(pwm * wheelScale);
+  return constrain(pwm, -255, 255);
+}
+
+float absf(float x) {
+  return (x >= 0.0) ? x : -x;
+}
+
+int signf(float x, float eps) {
+  if (x > eps) return 1;
+  if (x < -eps) return -1;
+  return 0;
+}
+
+int signl(long x) {
+  if (x > 0) return 1;
+  if (x < 0) return -1;
+  return 0;
+}
+
+void setMotorLeft(int pwm) {
+  if (pwm >= 0) {
+    digitalWrite(IN1, HIGH);
+    digitalWrite(IN2, LOW);
+    analogWrite(ENA, constrain(pwm, 0, 255));
+  } else {
+    digitalWrite(IN1, LOW);
+    digitalWrite(IN2, HIGH);
+    analogWrite(ENA, constrain(-pwm, 0, 255));
+  }
+}
+
+void setMotorRight(int pwm) {
+  if (pwm >= 0) {
+    digitalWrite(IN3, LOW);
+    digitalWrite(IN4, HIGH);
+    analogWrite(ENB, constrain(pwm, 0, 255));
+  } else {
+    digitalWrite(IN3, HIGH);
+    digitalWrite(IN4, LOW);
+    analogWrite(ENB, constrain(-pwm, 0, 255));
+  }
+}
+
+void stopMotors() {
+  analogWrite(ENA, 0);
+  analogWrite(ENB, 0);
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+}
+
+void readCommand() {
+  while (Serial.available() > 0) {
+    char c = Serial.read();
+
+    if (c == '\n') {
+      rxLine.trim();
+
+      if (rxLine == "PDRESET") {
+        resetPdProfile();
+        resetPdState();
+        resetSpeedAverager();
+        Serial.print("PDRESET,");
+        Serial.print(pdKp, 1);
+        Serial.print(",");
+        Serial.print(pdKd, 1);
+        Serial.print(",");
+        Serial.print(pdFfScale, 3);
+        Serial.print(",");
+        Serial.println(pdBrakeBoost, 2);
+        rxLine = "";
+        continue;
+      }
+
+      if (rxLine == "AUTO") {
+        rawMode = false;
+        rawPwmL = 0;
+        rawPwmR = 0;
+        vmaxMode = false;
+        resetSpeedAverager();
+        Serial.println("AUTO");
+        rxLine = "";
+        continue;
+      }
+
+      int commaIndex = rxLine.indexOf(',');
+
+      // (A3) A leading comma means the v field is missing -- reject explicitly
+      // so the bridge does not silently lose commands.
+      if (commaIndex == 0) {
+        Serial.println("CMD,ERR");
+        rxLine = "";
+        continue;
+      }
+
+      if (commaIndex > 0) {
+        if (rxLine.startsWith("GAIN,")) {
+          float newGain = rxLine.substring(commaIndex + 1).toFloat();
+          if (newGain > 0.0) {
+            pwmGain = newGain;
+            Serial.print("GAIN,");
+            Serial.println(pwmGain, 3);
+          }
+          rxLine = "";
+          continue;
+        }
+
+        if (rxLine.startsWith("CTRL,")) {
+          String mode = rxLine.substring(commaIndex + 1);
+          mode.trim();
+
+          if (mode == "PD") {
+            pdEnabled = true;
+            // Ensure deterministic PD behavior across repeated tests.
+            resetPdProfile();
+            resetPdState();
+            resetSpeedAverager();
+            Serial.print("CTRL,PD,");
+            Serial.print(pdKp, 1);
+            Serial.print(",");
+            Serial.print(pdKd, 1);
+            Serial.print(",");
+            Serial.print(pdFfScale, 3);
+            Serial.print(",");
+            Serial.println(pdBrakeBoost, 2);
+          } else if (mode == "OPEN") {
+            pdEnabled = false;
+            resetPdState();
+            resetSpeedAverager();
+            Serial.println("CTRL,OPEN");
+          } else {
+            Serial.println("CTRL,ERR");
+          }
+
+          rxLine = "";
+          continue;
+        }
+
+        if (rxLine.startsWith("PD,")) {
+          int comma2 = rxLine.indexOf(',', commaIndex + 1);
+          if (comma2 > commaIndex) {
+            float newKp = rxLine.substring(commaIndex + 1, comma2).toFloat();
+            float newKd = rxLine.substring(comma2 + 1).toFloat();
+
+            if (newKp >= 0.0 && newKp <= 5000.0 && newKd >= 0.0 && newKd <= 500.0) {
+              pdKp = newKp;
+              pdKd = newKd;
+              Serial.print("PD,");
+              Serial.print(pdKp, 1);
+              Serial.print(",");
+              Serial.println(pdKd, 1);
+            } else {
+              Serial.println("PD,ERR");
+            }
+          }
+          rxLine = "";
+          continue;
+        }
+
+        // (A2) PDRESET without comma is handled at the top of readCommand();
+        // a "PDRESET,..." form is unused, so the duplicate branch was removed.
+
+        if (rxLine.startsWith("PDFF,")) {
+          float newScale = rxLine.substring(commaIndex + 1).toFloat();
+          if (newScale >= 0.50 && newScale <= 1.20) {
+            pdFfScale = newScale;
+            Serial.print("PDFF,");
+            Serial.println(pdFfScale, 3);
+          } else {
+            Serial.println("PDFF,ERR");
+          }
+          rxLine = "";
+          continue;
+        }
+
+        if (rxLine.startsWith("PDBRAKE,")) {
+          float newBoost = rxLine.substring(commaIndex + 1).toFloat();
+          if (newBoost >= 1.00 && newBoost <= 3.00) {
+            pdBrakeBoost = newBoost;
+            Serial.print("PDBRAKE,");
+            Serial.println(pdBrakeBoost, 3);
+          } else {
+            Serial.println("PDBRAKE,ERR");
+          }
+          rxLine = "";
+          continue;
+        }
+
+        if (rxLine.startsWith("TRIM,")) {
+          int comma2 = rxLine.indexOf(',', commaIndex + 1);
+          if (comma2 > commaIndex) {
+            float newLeft = rxLine.substring(commaIndex + 1, comma2).toFloat();
+            float newRight = rxLine.substring(comma2 + 1).toFloat();
+
+            if (newLeft >= 0.70 && newLeft <= 1.40 && newRight >= 0.70 && newRight <= 1.40) {
+              leftPwmScale = newLeft;
+              rightPwmScale = newRight;
+              Serial.print("TRIM,");
+              Serial.print(leftPwmScale, 3);
+              Serial.print(",");
+              Serial.println(rightPwmScale, 3);
+            } else {
+              Serial.println("TRIM,ERR");
+            }
+          }
+          rxLine = "";
+          continue;
+        }
+
+        if (rxLine.startsWith("RAW,")) {
+          int comma2 = rxLine.indexOf(',', commaIndex + 1);
+          if (comma2 > commaIndex) {
+            rawPwmL = constrain(rxLine.substring(commaIndex + 1, comma2).toInt(), -255, 255);
+            rawPwmR = constrain(rxLine.substring(comma2 + 1).toInt(), -255, 255);
+            rawMode = true;
+            resetSpeedAverager();
+
+            Serial.print("RAW,");
+            Serial.print(rawPwmL);
+            Serial.print(",");
+            Serial.println(rawPwmR);
+          }
+          rxLine = "";
+          continue;
+        }
+
+        if (rxLine.startsWith("HOLD,")) {
+          int v = rxLine.substring(commaIndex + 1).toInt();
+          holdMode = (v != 0);
+          lastCmdTime = millis();
+          Serial.print("HOLD,");
+          Serial.println(holdMode ? 1 : 0);
+          rxLine = "";
+          continue;
+        }
+
+        if (rxLine.startsWith("VMAX,")) {
+          String action = rxLine.substring(commaIndex + 1);
+          action.trim();
+
+          if (action.startsWith("START")) {
+            int comma2 = action.indexOf(',');
+            if (comma2 > 0) {
+              long sec = action.substring(comma2 + 1).toInt();
+              if (sec >= 3 && sec <= 30) {
+                vmaxDurationMs = (unsigned long)sec * 1000UL;
+              }
+            }
+
+            rawMode = false;
+            rawPwmL = 0;
+            rawPwmR = 0;
+
+            vmaxMode = true;
+            vmaxStartMs = millis();
+            vmaxSampleCount = 0;
+            vmaxSum = 0.0;
+            vmaxPeak = 0.0;
+            resetSpeedAverager();
+            target_v = MAX_V_CMD;
+            target_w = 0.0;
+
+            // Full-power straight run for true vmax measurement.
+            rawMode = true;
+            rawPwmL = 255;
+            rawPwmR = 255;
+
+            Serial.print("VMAX,START,");
+            Serial.println(vmaxDurationMs);
+          } else if (action == "STOP") {
+            vmaxMode = false;
+            rawMode = false;
+            rawPwmL = 0;
+            rawPwmR = 0;
+            target_v = 0.0;
+            target_w = 0.0;
+            resetSpeedAverager();
+            stopMotors();
+            Serial.println("VMAX,STOP");
+          }
+
+          rxLine = "";
+          continue;
+        }
+
+        if (rxLine == "AUTO,0") {
+          rawMode = false;
+          rawPwmL = 0;
+          rawPwmR = 0;
+          vmaxMode = false;
+          resetSpeedAverager();
+          Serial.println("AUTO");
+          rxLine = "";
+          continue;
+        }
+
+        // Accept both "v,w" and "CMD,v,w" to ease ROS/bridge integration.
+        float cmdV = 0.0;
+        float cmdW = 0.0;
+
+        if (rxLine.startsWith("CMD,")) {
+          int comma2 = rxLine.indexOf(',', commaIndex + 1);
+          if (comma2 > commaIndex) {
+            cmdV = rxLine.substring(commaIndex + 1, comma2).toFloat();
+            cmdW = rxLine.substring(comma2 + 1).toFloat();
+          }
+        } else {
+          cmdV = rxLine.substring(0, commaIndex).toFloat();
+          cmdW = rxLine.substring(commaIndex + 1).toFloat();
+        }
+
+        target_v = constrain(cmdV, -MAX_V_CMD, MAX_V_CMD);
+        target_w = constrain(cmdW, -MAX_W_CMD, MAX_W_CMD);
+
+        if (absf(target_v) < CMD_V_DEADBAND) target_v = 0.0;
+        if (absf(target_w) < CMD_W_DEADBAND) target_w = 0.0;
+
+        // Any normal command exits RAW test mode.
+        rawMode = false;
+        vmaxMode = false;
+        if (target_v == 0.0 && target_w == 0.0) {
+          rawPwmL = 0;
+          rawPwmR = 0;
+          resetSpeedAverager();
+        }
+        lastCmdTime = millis();
+
+        Serial.print("CMD,");
+        Serial.print(target_v, 3);
+        Serial.print(",");
+        Serial.println(target_w, 3);
+      }
+
+      rxLine = "";
+    } else {
+      // (A4) Cap rxLine to avoid SRAM exhaustion if Serial never sees '\n'
+      // (e.g. noisy USB / bridge sending binary). Longest valid command is
+      // ~13 chars ("PDBRAKE,1.50"), 64 is plenty.
+      if (rxLine.length() >= 64) {
+        rxLine = "";
+      }
+      rxLine += c;
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(ENA, OUTPUT);
+
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+  pinMode(ENB, OUTPUT);
+
+  pinMode(ENC_L_A, INPUT_PULLUP);
+  pinMode(ENC_L_B, INPUT_PULLUP);
+  pinMode(ENC_R_A, INPUT_PULLUP);
+  pinMode(ENC_R_B, INPUT_PULLUP);
+
+  attachInterrupt(digitalPinToInterrupt(ENC_L_B), isrLeft, RISING);
+  attachInterrupt(digitalPinToInterrupt(ENC_R_B), isrRight, RISING);
+
+  stopMotors();
+  resetSpeedAverager();
+  lastCmdTime = millis();
+  lastSample = millis();
+
+  Serial.println("READY");
+  // (B5) Tell the bridge which control mode the firmware booted into so the
+  // Pi side does not have to guess between PD and OPEN.
+  if (pdEnabled) {
+    Serial.print("CTRL,PD,");
+    Serial.print(pdKp, 1);
+    Serial.print(",");
+    Serial.print(pdKd, 1);
+    Serial.print(",");
+    Serial.print(pdFfScale, 3);
+    Serial.print(",");
+    Serial.println(pdBrakeBoost, 2);
+  } else {
+    Serial.println("CTRL,OPEN");
+  }
+}
+
+void loop() {
+  readCommand();
+
+  if (vmaxMode) {
+    target_v = MAX_V_CMD;
+    target_w = 0.0;
+  }
+
+  // HOLD/VMAX bench modes bypass the safety timeout so the last typed command keeps running.
+  if (cmdTimeout > 0 && !holdMode && !vmaxMode &&
+      millis() - lastCmdTime > cmdTimeout) {
+    target_v = 0.0;
+    target_w = 0.0;
+  }
+
+  float vRRef = target_v + (L / 2.0) * target_w;
+  float vLRef = target_v - (L / 2.0) * target_w;
+  float vRFF = vRRef;
+  float vLFF = vLRef;
+  bool isPureTurn = (absf(target_v) < STOP_EPS && absf(target_w) >= STOP_EPS);
+  int pwmMin = isPureTurn ? PWM_MIN_TURN : PWM_MIN_STRAIGHT;
+
+  if (pdEnabled) {
+    vRFF *= pdFfScale;
+    vLFF *= pdFfScale;
+  }
+
+  // Keep the old turn boost only for OPEN mode feedforward.
+  if (isPureTurn && !pdEnabled) {
+    vRFF *= TURN_GAIN_BOOST;
+    vLFF *= TURN_GAIN_BOOST;
+  }
+
+  int pwmR, pwmL;
+
+  if (rawMode) {
+    pwmL = rawPwmL;
+    pwmR = rawPwmR;
+  } else if (pdEnabled) {
+    // Linear feedforward + PD correction: gives PD real headroom to track.
+    pwmR = velocityToPwmLinear(vRFF, pwmMin, rightPwmScale);
+    pwmL = velocityToPwmLinear(vLFF, pwmMin, leftPwmScale);
+    pwmL = constrain(pwmL + pdCorrL, -255, 255);
+    pwmR = constrain(pwmR + pdCorrR, -255, 255);
+  } else {
+    // Open-loop: use the validated nonlinear mapping.
+    pwmR = velocityToPwm(vRFF, pwmMin, rightPwmScale);
+    pwmL = velocityToPwm(vLFF, pwmMin, leftPwmScale);
+  }
+
+  if (!rawMode && absf(target_v) < STOP_EPS && absf(target_w) < STOP_EPS) {
+    stopMotors();
+  } else {
+    setMotorLeft(pwmL);
+    setMotorRight(pwmR);
+  }
+
+  unsigned long nowMs = millis();
+  if (nowMs - lastSample >= sampleTime) {
+    unsigned long elapsedMs = nowMs - lastSample;
+    lastSample = nowMs;
+
+    noInterrupts();
+    long currentLeft = countLeft;
+    long currentRight = countRight;
+    interrupts();
+
+    long deltaLeft = currentLeft - prevLeft;
+    long deltaRight = currentRight - prevRight;
+
+    prevLeft = currentLeft;
+    prevRight = currentRight;
+
+    float dt = elapsedMs / 1000.0;
+    if (dt <= 0.0) dt = sampleTime / 1000.0;
+
+    avgSumLeft -= avgHistLeft[avgIdx];
+    avgSumRight -= avgHistRight[avgIdx];
+    avgHistLeft[avgIdx] = deltaLeft;
+    avgHistRight[avgIdx] = deltaRight;
+    avgSumLeft += deltaLeft;
+    avgSumRight += deltaRight;
+    avgIdx++;
+    if (avgIdx >= SPEED_AVG_SAMPLES) avgIdx = 0;
+    if (avgCount < SPEED_AVG_SAMPLES) avgCount++;
+
+    float dtAvg = dt * (float)avgCount;
+    if (dtAvg <= 0.0) dtAvg = dt;
+
+    float omegaL = (2.0 * PI * avgSumLeft) / (PPR * dtAvg);
+    float omegaR = (2.0 * PI * avgSumRight) / (PPR * dtAvg);
+    float vLMeasRaw = omegaL * r;
+    float vRMeasRaw = omegaR * r;
+
+    // Use moving-average speed directly (no extra LPF to avoid feedback delay).
+    float vLMeas = vLMeasRaw;
+    float vRMeas = vRMeasRaw;
+    vLMeasFilt = vLMeas;
+    vRMeasFilt = vRMeas;
+    float vMeas = (vRMeas + vLMeas) / 2.0;
+    float vAbs = (vMeas >= 0.0) ? vMeas : -vMeas;
+    float wMeas = (vRMeas - vLMeas) / L;
+    if (pdEnabled && !rawMode) {
+      bool cmdMoving = (absf(vLRef) >= STOP_EPS || absf(vRRef) >= STOP_EPS);
+      if (cmdMoving) {
+        float errL = vLRef - vLMeas;
+        float errR = vRRef - vRMeas;
+
+        if (absf(errL) < PD_ERR_EPS) errL = 0.0;
+        if (absf(errR) < PD_ERR_EPS) errR = 0.0;
+
+        float dErrL = (errL - prevErrL) / dt;
+        float dErrR = (errR - prevErrR) / dt;
+
+        filtDErrL = PD_DERIV_ALPHA * dErrL + (1.0 - PD_DERIV_ALPHA) * filtDErrL;
+        filtDErrR = PD_DERIV_ALPHA * dErrR + (1.0 - PD_DERIV_ALPHA) * filtDErrR;
+
+        float corrL = pdKp * errL + pdKd * filtDErrL;
+        float corrR = pdKp * errR + pdKd * filtDErrR;
+
+        float signRefL = (vLRef >= 0.0) ? 1.0 : -1.0;
+        float signRefR = (vRRef >= 0.0) ? 1.0 : -1.0;
+        bool overspeedL = (absf(vLRef) >= STOP_EPS) && (signRefL * errL < 0.0);
+        bool overspeedR = (absf(vRRef) >= STOP_EPS) && (signRefR * errR < 0.0);
+
+        if (overspeedL) corrL *= pdBrakeBoost;
+        if (overspeedR) corrR *= pdBrakeBoost;
+
+        int minCorrL = -PD_CORR_LIMIT;
+        int maxCorrL = PD_CORR_LIMIT;
+        int minCorrR = -PD_CORR_LIMIT;
+        int maxCorrR = PD_CORR_LIMIT;
+
+        if (overspeedL) {
+          if (signRefL > 0.0) {
+            minCorrL = -(PD_CORR_LIMIT + PD_OVERSPEED_EXTRA);
+          } else {
+            maxCorrL = PD_CORR_LIMIT + PD_OVERSPEED_EXTRA;
+          }
+        }
+        if (overspeedR) {
+          if (signRefR > 0.0) {
+            minCorrR = -(PD_CORR_LIMIT + PD_OVERSPEED_EXTRA);
+          } else {
+            maxCorrR = PD_CORR_LIMIT + PD_OVERSPEED_EXTRA;
+          }
+        }
+
+        pdCorrL = constrain((int)corrL, minCorrL, maxCorrL);
+        pdCorrR = constrain((int)corrR, minCorrR, maxCorrR);
+
+        prevErrL = errL;
+        prevErrR = errR;
+      } else {
+        prevErrL = 0.0;
+        prevErrR = 0.0;
+        filtDErrL = 0.0;
+        filtDErrR = 0.0;
+        pdCorrL = 0;
+        pdCorrR = 0;
+      }
+    } else {
+      prevErrL = 0.0;
+      prevErrR = 0.0;
+      filtDErrL = 0.0;
+      filtDErrR = 0.0;
+      pdCorrL = 0;
+      pdCorrR = 0;
+    }
+
+    // PD correction is applied at the next loop() iteration (no double motor write).
+
+    int dirRefL = signf(vLRef, STOP_EPS);
+    int dirRefR = signf(vRRef, STOP_EPS);
+    int dirMeasL = signl(deltaLeft);
+    int dirMeasR = signl(deltaRight);
+    int matchL = (dirRefL == 0 || dirMeasL == 0 || dirRefL == dirMeasL) ? 1 : 0;
+    int matchR = (dirRefR == 0 || dirMeasR == 0 || dirRefR == dirMeasR) ? 1 : 0;
+
+    if (STREAM_WHEN_IDLE || deltaLeft != 0 || deltaRight != 0 || target_v != 0.0 || target_w != 0.0 || rawMode) {
+      // Unified telemetry frame: DATA,t_ms,v_ref,w_ref,v_meas,w_meas,pwmL,pwmR,dL,dR
+      Serial.print("DATA,");
+      Serial.print(nowMs);
+      Serial.print(",");
+      Serial.print(target_v, 3);
+      Serial.print(",");
+      Serial.print(target_w, 3);
+      Serial.print(",");
+      Serial.print(vMeas, 3);
+      Serial.print(",");
+      Serial.print(wMeas, 3);
+      Serial.print(",");
+      Serial.print(pwmL);
+      Serial.print(",");
+      Serial.print(pwmR);
+      Serial.print(",");
+      Serial.print(deltaLeft);
+      Serial.print(",");
+      Serial.print(deltaRight);
+      Serial.print(",");
+      Serial.print(pwmGain, 1);
+      Serial.print(",");
+      Serial.print(pdEnabled ? 1 : 0);
+      Serial.print(",");
+      Serial.print(pdCorrL);
+      Serial.print(",");
+      Serial.println(pdCorrR);
+
+      if (vmaxMode) {
+        if (vmaxSampleCount >= vmaxWarmupSamples) {
+          vmaxSum += vAbs;
+          if (vAbs > vmaxPeak) vmaxPeak = vAbs;
+        }
+        vmaxSampleCount++;
+
+        if (millis() - vmaxStartMs >= vmaxDurationMs) {
+          long effectiveSamples = vmaxSampleCount - vmaxWarmupSamples;
+          if (effectiveSamples < 1) effectiveSamples = 1;
+          float vAvg = vmaxSum / (float)effectiveSamples;
+
+          Serial.print("VMAX,RESULT,");
+          Serial.print(vAvg, 4);
+          Serial.print(",");
+          Serial.print(vmaxPeak, 4);
+          Serial.print(",");
+          Serial.println(effectiveSamples);
+
+          vmaxMode = false;
+          rawMode = false;
+          rawPwmL = 0;
+          rawPwmR = 0;
+          target_v = 0.0;
+          target_w = 0.0;
+          stopMotors();
+        }
+      }
+
+      if (DEBUG_VERBOSE) {
+        Serial.print("KIN,");
+        Serial.print(vLRef, 3);
+        Serial.print(",");
+        Serial.println(vRRef, 3);
+
+        Serial.print("PWMCFG,");
+        Serial.print(pwmMin);
+        Serial.print(",");
+        Serial.println(isPureTurn ? 1 : 0);
+
+        Serial.print("WHEEL_W,");
+        Serial.print(omegaL, 3);
+        Serial.print(",");
+        Serial.println(omegaR, 3);
+
+        Serial.print("WHEEL_V_RAW,");
+        Serial.print(vLMeasRaw, 3);
+        Serial.print(",");
+        Serial.println(vRMeasRaw, 3);
+
+        Serial.print("WHEEL_V_FILT,");
+        Serial.print(vLMeas, 3);
+        Serial.print(",");
+        Serial.println(vRMeas, 3);
+
+        Serial.print("DIRCHK,");
+        Serial.print(dirRefL);
+        Serial.print(",");
+        Serial.print(dirRefR);
+        Serial.print(",");
+        Serial.print(dirMeasL);
+        Serial.print(",");
+        Serial.print(dirMeasR);
+        Serial.print(",");
+        Serial.print(matchL);
+        Serial.print(",");
+        Serial.println(matchR);
+
+        Serial.print("PDSTAT,");
+        Serial.print(pdEnabled ? 1 : 0);
+        Serial.print(",");
+        Serial.print(pdKp, 1);
+        Serial.print(",");
+        Serial.print(pdKd, 1);
+        Serial.print(",");
+        Serial.print(pdFfScale, 3);
+        Serial.print(",");
+        Serial.print(pdBrakeBoost, 2);
+        Serial.print(",");
+        Serial.print(pdCorrL);
+        Serial.print(",");
+        Serial.println(pdCorrR);
+
+        Serial.println("OK");
+      }
+    }
+  }
+}
